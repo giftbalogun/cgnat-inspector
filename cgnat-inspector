@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # cgnat-inspector
 # Detect Carrier Grade NAT (CGNAT) using multiple independent
-# networking tests, and report a weighted confidence score.
+# networking tests, weighed as evidence into a confidence score rather
+# than concluded from any single signal.
 #
 # https://github.com/giftbalogun/cgnat-inspector
 #
 # Exit codes:
-#   0  Public IP
-#   1  CGNAT
-#   2  Double NAT
-#   3  Internet unreachable
-#   4  Missing dependency
-#   5  Router unreachable
-#   6  Unknown error
+#   0  Public IPv4 confirmed (No CGNAT)
+#   1  CGNAT Detected
+#   2  Possible CGNAT
+#   3  Inconclusive
+#   4  Internet unreachable
+#   5  DNS failure
+#   6  Internal error
 #
 # This script is a thin orchestration layer: all real logic lives in
 # lib/*.sh so it can be independently unit tested.
@@ -38,14 +39,21 @@ resolve_script_dir() {
 SCRIPT_DIR="$(resolve_script_dir)"
 LIB_DIR="${SCRIPT_DIR}/lib"
 
-# Exit code constants, referenced by lib/detect.sh via CGNAT_EXIT_*.
+# Exit code constants -- single source of truth, also read by
+# lib/detect.sh's detect_status_exit_code() via ${CGNAT_EXIT_*:-default}.
+# shellcheck disable=SC2034  # consumed indirectly by lib/detect.sh
 readonly CGNAT_EXIT_PUBLIC=0
+# shellcheck disable=SC2034
 readonly CGNAT_EXIT_CGNAT=1
-readonly CGNAT_EXIT_DOUBLE_NAT=2
-readonly CGNAT_EXIT_NO_INTERNET=3
-readonly CGNAT_EXIT_MISSING_DEP=4
-readonly CGNAT_EXIT_ROUTER_UNREACHABLE=5
-readonly CGNAT_EXIT_UNKNOWN=6
+# shellcheck disable=SC2034
+readonly CGNAT_EXIT_POSSIBLE_CGNAT=2
+# shellcheck disable=SC2034
+readonly CGNAT_EXIT_INCONCLUSIVE=3
+# shellcheck disable=SC2034
+readonly CGNAT_EXIT_NO_INTERNET=4
+# shellcheck disable=SC2034
+readonly CGNAT_EXIT_DNS_FAILURE=5
+readonly CGNAT_EXIT_INTERNAL_ERROR=6
 
 # shellcheck source=lib/colors.sh
 source "${LIB_DIR}/colors.sh"
@@ -92,16 +100,17 @@ OPTIONS:
     --debug         Print debug-level internal diagnostics
     --quiet         Suppress informational/log output (results still print)
     --ipv4-only     Skip all IPv6 tests
-    --ipv6-only     Skip all IPv4 tests (CGNAT detection itself is IPv4-only,
-                    but this limits informational IPv4 checks)
+    --ipv6-only     Skip IPv4 public-address lookup (CGNAT detection itself
+                    is inherently IPv4)
     --traceroute    Force traceroute analysis even if it would otherwise be
-                    skipped, and include it in JSON output
-    --no-upnp       Skip UPnP router WAN IP / double-NAT detection
+                    skipped, and include raw hop data in JSON output
+    --no-upnp       Skip UPnP router WAN IP query
 
 EXIT CODES:
-    0  Public IP        3  Internet unreachable   5  Router unreachable
-    1  CGNAT             4  Missing dependency      6  Unknown error
-    2  Double NAT
+    0  Public IPv4 confirmed (No CGNAT)    4  Internet unreachable
+    1  CGNAT Detected                       5  DNS failure
+    2  Possible CGNAT                       6  Internal error
+    3  Inconclusive
 
 Project home: ${CGNAT_REPO_URL}
 EOF
@@ -146,7 +155,7 @@ parse_args() {
             *)
                 log_error "Unknown option: $1"
                 printf 'Run "cgnat-inspector --help" for usage.\n' >&2
-                exit "${CGNAT_EXIT_UNKNOWN}"
+                exit "${CGNAT_EXIT_INTERNAL_ERROR}"
                 ;;
         esac
         shift
@@ -154,7 +163,7 @@ parse_args() {
 
     if [[ "${OPT_IPV4_ONLY}" == "true" && "${OPT_IPV6_ONLY}" == "true" ]]; then
         log_error "--ipv4-only and --ipv6-only are mutually exclusive."
-        exit "${CGNAT_EXIT_UNKNOWN}"
+        exit "${CGNAT_EXIT_INTERNAL_ERROR}"
     fi
 }
 
@@ -176,12 +185,12 @@ main() {
     # -------------------------------------------------------------------
     # Gather raw facts
     # -------------------------------------------------------------------
-    local local_ip gateway public_ip public_ipv6 wan_ip=""
-    local internet_ok=false gateway_ok=false
+    local local_ip gateway public_ip="" public_ipv6=""
+    local internet_ok=false gateway_ok=false dns_ok=false
     local ipv6_available=false
 
     local_ip=$(net_get_local_ip) || local_ip=""
-    log_verbose "Local IP: ${local_ip:-unknown}"
+    log_verbose "LAN IP: ${local_ip:-unknown}"
 
     gateway=$(net_get_gateway) || gateway=""
     log_verbose "Gateway: ${gateway:-unknown}"
@@ -200,14 +209,24 @@ main() {
         log_verbose "Gateway: unreachable"
     fi
 
-    public_ip=""
-    if [[ "${internet_ok}" == "true" && "${OPT_IPV6_ONLY}" != "true" ]]; then
-        public_ip=$(net_get_public_ipv4) || public_ip=""
-        log_verbose "Public IPv4: ${public_ip:-unknown}"
+    # DNS is only meaningful to test once we know raw connectivity works;
+    # otherwise a DNS failure is just a symptom of having no network at
+    # all, not a distinct problem worth its own status/exit code.
+    if [[ "${internet_ok}" == "true" && "${gateway_ok}" == "true" ]]; then
+        if net_dns_resolves; then
+            dns_ok=true
+            log_verbose "DNS: resolving"
+        else
+            log_verbose "DNS: NOT resolving"
+        fi
     fi
 
-    public_ipv6=""
-    if [[ "${OPT_IPV4_ONLY}" != "true" && "${internet_ok}" == "true" ]]; then
+    if [[ "${internet_ok}" == "true" && "${dns_ok}" == "true" && "${OPT_IPV6_ONLY}" != "true" ]]; then
+        public_ip=$(net_get_public_ipv4) || public_ip=""
+        log_verbose "Public IPv4: ${public_ip:-Unavailable}"
+    fi
+
+    if [[ "${OPT_IPV4_ONLY}" != "true" && "${internet_ok}" == "true" && "${dns_ok}" == "true" ]]; then
         if public_ipv6=$(net_get_public_ipv6); then
             ipv6_available=true
         else
@@ -216,91 +235,142 @@ main() {
         log_verbose "Public IPv6: ${public_ipv6:-Not Available}"
     fi
 
-    # WAN IP: prefer UPnP-reported router WAN, otherwise treat the local
-    # machine's own address as the best available proxy when this host
-    # IS the router-facing device (common in homelab setups where the
-    # test runs on a machine with a direct WAN-side view, e.g. behind a
-    # modem in bridge mode). We never fabricate data: if unknown, it
-    # stays empty and is reported honestly.
-    local wan_source="none"
-    if [[ "${OPT_NO_UPNP}" != "true" ]]; then
-        if wan_ip=$(net_get_wan_ip_upnp); then
-            wan_source="upnp"
-            log_verbose "WAN IP (via UPnP): ${wan_ip}"
-        fi
+    # Router WAN: UPnP only. If it cannot be obtained, it stays empty
+    # and is reported honestly as "Unknown" -- never guessed from the
+    # local LAN interface address (that was the bug this refactor
+    # fixes: the LAN address is NOT the router's WAN address).
+    local router_wan=""
+    if [[ "${OPT_NO_UPNP}" != "true" && "${internet_ok}" == "true" ]]; then
+        router_wan=$(net_get_router_wan_ip) || router_wan=""
+        log_verbose "Router WAN (via UPnP): ${router_wan:-Unknown}"
     fi
 
-    if [[ -z "${wan_ip}" ]]; then
-        # Fall back: if the local IP itself is not private/CGNAT, this
-        # host likely has a directly routable address, so WAN == local.
-        if [[ -n "${local_ip}" ]] && ! detect_is_private_ipv4 "${local_ip}" && ! detect_is_cgnat_range "${local_ip}"; then
-            wan_ip="${local_ip}"
-            wan_source="local"
-        else
-            wan_ip="${local_ip}"
-            wan_source="local-private"
-        fi
-        log_verbose "WAN IP (fallback, source=${wan_source}): ${wan_ip:-unknown}"
+    # STUN: independent, best-effort second opinion on the public
+    # address. Never required; absence contributes no evidence either
+    # way (see lib/detect.sh).
+    local stun_ip=""
+    if [[ "${internet_ok}" == "true" && "${dns_ok}" == "true" ]]; then
+        stun_ip=$(net_stun_get_public_ip) || stun_ip=""
+        log_verbose "STUN public IP: ${stun_ip:-unavailable}"
     fi
 
     # -------------------------------------------------------------------
-    # Traceroute analysis
+    # Traceroute analysis (supporting evidence only)
     # -------------------------------------------------------------------
-    local traceroute_output="" traceroute_private=false
+    local traceroute_output="" traceroute_ran=false
+    local tr_private_hops=0 tr_public_hops=0 tr_backbone_private=false
     local run_traceroute=true
     if [[ "${internet_ok}" != "true" && "${OPT_TRACEROUTE}" != "true" ]]; then
-        # Normally skip traceroute when we already know there's no
-        # internet path -- it would just time out on every hop. --traceroute
-        # forces it anyway, e.g. to inspect how far the path gets.
         run_traceroute=false
     fi
 
     if [[ "${run_traceroute}" == "true" ]]; then
         traceroute_output=$(tr_run_traceroute "1.1.1.1" 8) || traceroute_output=""
         if [[ -n "${traceroute_output}" ]]; then
-            if printf '%s\n' "${traceroute_output}" | tr_has_private_hop_beyond_gateway "${gateway}"; then
-                traceroute_private=true
-            fi
-            log_verbose "Traceroute: $(printf '%s' "${traceroute_output}" | wc -l) hops captured"
+            traceroute_ran=true
+            local tr_summary
+            tr_summary=$(printf '%s\n' "${traceroute_output}" | tr_analyze "${gateway}")
+            while IFS='=' read -r key value; do
+                case "${key}" in
+                    private_hops)     tr_private_hops="${value}" ;;
+                    public_hops)      tr_public_hops="${value}" ;;
+                    backbone_private) tr_backbone_private="${value}" ;;
+                esac
+            done <<< "${tr_summary}"
+            log_verbose "Traceroute: ${tr_private_hops} private hop(s), ${tr_public_hops} public hop(s) beyond gateway"
         else
             log_verbose "Traceroute: unavailable or produced no output"
         fi
     fi
 
     # -------------------------------------------------------------------
-    # Classification
+    # Classification of gathered facts into evidence booleans
     # -------------------------------------------------------------------
-    local wan_in_cgnat=false
-    local wan_is_private=false
-    local wan_differs_from_public=false
-    local double_nat_detected=false
+    local router_wan_known=false router_wan_nonpublic=false
+    local public_ip_known=false comparison_possible=false public_differs=false
+    local stun_known=false stun_mismatch=false
 
-    if [[ -n "${wan_ip}" ]] && detect_is_cgnat_range "${wan_ip}"; then
-        wan_in_cgnat=true
-    fi
-
-    if [[ -n "${wan_ip}" ]] && detect_is_private_ipv4 "${wan_ip}"; then
-        wan_is_private=true
-    fi
-
-    if [[ -n "${wan_ip}" && -n "${public_ip}" ]] && ! detect_wan_matches_public "${wan_ip}" "${public_ip}"; then
-        wan_differs_from_public=true
-    fi
-
-    if [[ "${OPT_NO_UPNP}" != "true" && "${wan_source}" == "upnp" ]]; then
-        if detect_double_nat "${wan_ip}"; then
-            double_nat_detected=true
+    if [[ -n "${router_wan}" ]]; then
+        router_wan_known=true
+        if detect_is_non_public_ipv4 "${router_wan}"; then
+            router_wan_nonpublic=true
         fi
     fi
 
+    if [[ -n "${public_ip}" ]]; then
+        public_ip_known=true
+    fi
+
+    if [[ "${router_wan_known}" == "true" && "${public_ip_known}" == "true" ]]; then
+        comparison_possible=true
+        if ! detect_addresses_match "${router_wan}" "${public_ip}"; then
+            public_differs=true
+        fi
+    fi
+
+    if [[ -n "${stun_ip}" ]]; then
+        stun_known=true
+        if [[ "${public_ip_known}" == "true" ]] && ! detect_addresses_match "${stun_ip}" "${public_ip}"; then
+            stun_mismatch=true
+        fi
+    fi
+
+    # "Multiple independent indicators" bonus: true when at least two
+    # of the strong, independent signals agree.
+    local strong_count=0
+    [[ "${router_wan_nonpublic}" == "true" ]] && strong_count=$(( strong_count + 1 ))
+    [[ "${public_differs}" == "true" ]] && strong_count=$(( strong_count + 1 ))
+    [[ "${tr_backbone_private}" == "true" ]] && strong_count=$(( strong_count + 1 ))
+    [[ "${stun_known}" == "true" && "${stun_mismatch}" == "true" ]] && strong_count=$(( strong_count + 1 ))
+    local multiple_indicators=false
+    (( strong_count >= 2 )) && multiple_indicators=true
+
+    # -------------------------------------------------------------------
+    # Scoring and final status
+    # -------------------------------------------------------------------
     local score
-    score=$(detect_compute_confidence "${wan_in_cgnat}" "${wan_is_private}" "${wan_differs_from_public}" "${traceroute_private}")
+    score=$(detect_compute_score \
+        "${router_wan_known}" "${router_wan_nonpublic}" \
+        "${public_ip_known}" "${public_differs}" \
+        "${tr_backbone_private}" \
+        "${stun_known}" "${stun_mismatch}" \
+        "${ipv6_available}")
+
+    local definitive_public=false
+    if [[ "${router_wan_known}" == "true" && "${router_wan_nonpublic}" != "true" \
+        && "${public_ip_known}" == "true" && "${public_differs}" != "true" ]]; then
+        definitive_public=true
+    fi
 
     local status
-    status=$(detect_final_status "${internet_ok}" "${wan_in_cgnat}" "${wan_is_private}" "${double_nat_detected}" "${gateway_ok}")
+    status=$(detect_final_status "${internet_ok}" "${gateway_ok}" "${dns_ok}" "${definitive_public}" "${score}")
+
+    # A definitive PUBLIC result has, by definition, no CGNAT evidence.
+    # Likewise, when connectivity itself is broken (NO_INTERNET /
+    # DNS_FAILURE), the numeric score is just leftover "uncertainty"
+    # weight from evidence that couldn't be gathered -- not a
+    # meaningful CGNAT confidence value -- so it's suppressed rather
+    # than shown alongside a status it doesn't actually describe.
+    case "${status}" in
+        PUBLIC|NO_INTERNET|DNS_FAILURE)
+            score=0
+            ;;
+    esac
+
+    local conclusion
+    conclusion=$(detect_conclusion "${status}")
 
     local recommendations
     recommendations=$(detect_recommendations "${status}" "${ipv6_available}")
+
+    local evidence_lines
+    evidence_lines=$(detect_build_evidence \
+        "${internet_ok}" "${gateway_ok}" "${dns_ok}" \
+        "${router_wan_known}" "${router_wan_nonpublic}" \
+        "${public_ip_known}" "${comparison_possible}" "${public_differs}" \
+        "${traceroute_ran}" "${tr_backbone_private}" \
+        "${stun_known}" "${stun_mismatch}" \
+        "${ipv6_available}" "${multiple_indicators}")
 
     # -------------------------------------------------------------------
     # Output
@@ -316,35 +386,22 @@ main() {
             "${score}" \
             "${local_ip}" \
             "${gateway}" \
-            "${wan_ip}" \
+            "${router_wan}" \
             "${public_ip}" \
             "${public_ipv6:-}" \
-            "${wan_is_private}" \
-            "${wan_in_cgnat}" \
-            "${double_nat_detected}" \
-            "${traceroute_private}" \
+            "${evidence_lines}" \
+            "${conclusion}" \
             "${recommendations}" \
             "${json_traceroute_hops}"
     else
         out_banner
 
         out_section_title "Network Information"
-        out_kv "Local IP" "${local_ip}"
+        out_kv "LAN IP" "${local_ip}"
         out_kv "Gateway" "${gateway}"
-        out_kv "WAN" "${wan_ip}"
-        out_kv "Public IPv4" "${public_ip}"
+        out_kv "Router WAN" "${router_wan:-Unknown}"
+        out_kv "Public IPv4" "${public_ip:-Unavailable}"
         out_kv "IPv6" "${public_ipv6:-Not Available}"
-
-        out_thin_rule
-        printf '\n'
-        out_section_title "Tests"
-        out_check "${internet_ok}" "Internet reachable"
-        out_check "${gateway_ok}" "Gateway reachable"
-        out_check "$([[ "${wan_is_private}" == "true" ]] && echo false || echo true)" "WAN is private"
-        out_check "$([[ "${wan_in_cgnat}" == "true" ]] && echo false || echo true)" "WAN is CGNAT"
-        out_check "$([[ -n "${public_ip}" ]] && echo true || echo false)" "Public IPv4 detected"
-        out_check "$([[ "${wan_differs_from_public}" == "true" ]] && echo false || echo true)" "WAN differs from Public IP"
-        printf '\n'
 
         if [[ -n "${traceroute_output}" ]]; then
             out_thin_rule
@@ -354,18 +411,29 @@ main() {
             printf '\n'
         fi
 
-        out_thin_rule
+        out_rule
+        printf '\nAssessment\n\n'
+        out_rule
         printf '\n'
-        out_section_title "Result"
-        printf 'STATUS\n\n'
-        out_status_block "${status}"
+
+        printf 'Status\n\n'
+        out_status_line "${status}"
         printf '\n'
+
         printf 'Confidence\n\n'
-        out_confidence_bar "${score}"
+        out_confidence_line "${score}"
         printf '\n'
+
+        printf 'Evidence\n\n'
+        printf '%s\n' "${evidence_lines}" | out_evidence_checklist
+        printf '\n'
+
+        printf 'Conclusion\n\n%s\n\n' "${conclusion}"
+
         printf 'Recommendations\n\n'
         printf '%s\n' "${recommendations}" | out_recommendations
         printf '\n'
+
         printf 'Exit Code\n\n%s\n' "$(detect_status_exit_code "${status}")"
     fi
 

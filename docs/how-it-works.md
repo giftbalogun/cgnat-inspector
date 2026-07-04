@@ -1,153 +1,170 @@
 # How It Works
 
-CGNAT Inspector never relies on a single signal. Instead, it gathers several
-independent facts about your network and combines them into a weighted
-confidence score. This document explains each test in detail.
+CGNAT Inspector never concludes CGNAT from a single signal. Instead, it
+gathers several independent facts about your network and combines them
+into an **evidence-based confidence score**. This document explains each
+test, the scoring engine, and why the design deliberately avoids false
+positives.
 
-## 1. Local IP detection
+## Why evidence-based, not a single yes/no check
 
-**Function:** `net_get_local_ip` (`lib/network.sh`)
+An earlier design treated a single strong-looking signal (e.g. "the
+router's WAN address looks private") as proof of CGNAT. In practice that
+produces false positives: the router might simply not have obtained its
+lease yet, UPnP might be misreporting, or a lookup service might be
+temporarily down. The current design instead:
 
-Uses `ip -4 route get 1.1.1.1` to ask the kernel which local address would be
-used to reach the internet, then falls back to the first global-scope IPv4
-address on any interface if that fails. This is the address your machine
-sees on its own network interface (e.g. `192.168.1.10`).
+1. Gathers several independent signals.
+2. Weighs each one, including a smaller weight for "we don't know" (so
+   missing data nudges the result toward **Inconclusive**, never toward a
+   false **CGNAT Detected**).
+3. Only reaches a strong conclusion once multiple signals corroborate
+   each other.
 
-## 2. Gateway detection
+## 1. LAN IP, Gateway, Router WAN -- three different addresses
 
-**Function:** `net_get_gateway`
+CGNAT Inspector is careful to never conflate these:
 
-Reads the default route via `ip -4 route show default` and extracts the
-`via` address. This is your router's LAN-facing address.
+- **LAN IP** (`net_get_local_ip`): this machine's own address on its local
+  network (e.g. `192.168.1.10`). Never reported as a WAN or public
+  address.
+- **Gateway** (`net_get_gateway`): your router's LAN-facing address.
+- **Router WAN** (`net_get_router_wan_ip`): the address your router
+  believes it has been assigned by your ISP, obtained **only** via a live
+  UPnP/IGD query (`upnpc -s`, from `miniupnpc`). If UPnP is unavailable,
+  disabled, or doesn't respond, this is reported as `Unknown` -- it is
+  **never** filled in with the LAN IP or any other guessed value. Earlier
+  versions of this tool mistakenly reported the local interface address
+  as "WAN"; this has been fixed.
 
-## 3. Internet connectivity
-
-**Function:** `net_check_internet`
-
-Pings several well-known, highly available anycast addresses
-(`1.1.1.1`, `8.8.8.8`, `9.9.9.9`). If ICMP is blocked entirely, falls back to
-an HTTPS request via `curl`. This is a prerequisite check: if it fails,
-CGNAT Inspector reports `NO_INTERNET` immediately rather than guessing.
-
-## 4. Gateway reachability
-
-**Function:** `net_check_gateway_reachable`
-
-A simple ping to the detected gateway. If your machine can reach the
-internet but not the gateway (unusual, but possible with certain routing
-setups), the tool reports `ROUTER_UNREACHABLE`.
-
-## 5. Public IPv4 lookup
+## 2. Public IPv4 detection
 
 **Function:** `net_get_public_ipv4`
 
-Queries multiple independent "echo" services (ipify, ifconfig.me,
-icanhazip.com) and uses the first valid response. Multiple providers are
-used so a single service outage doesn't produce a false result.
+Queries multiple independent HTTP(S) echo services, in order, retrying
+each one before moving to the next:
 
-## 6. WAN IP determination
+- `api.ipify.org`
+- `ifconfig.me/ip`
+- `icanhazip.com`
+- `checkip.amazonaws.com`
+- `ipv4.icanhazip.com`
 
-The "WAN IP" is the address your router believes it has been assigned by
-your ISP. CGNAT Inspector determines this two ways, in order of
-preference:
+Each request is time-limited (`CURL_TIMEOUT`, default 5s). If every
+provider fails, the tool reports `Public IPv4: Unavailable` -- explicitly
+distinct from `Unknown`, since "unavailable" means lookups were attempted
+and failed, not that the check was skipped.
 
-1. **UPnP/IGD query** (`net_get_wan_ip_upnp`, requires `upnpc` from
-   `miniupnpc`): asks the router directly for its `ExternalIPAddress`. This
-   is the most accurate signal, because it comes straight from the router.
-2. **Fallback heuristic**: if UPnP is unavailable or disabled
-   (`--no-upnp`), and the local machine's own IP is *not* private/CGNAT
-   space, the tool assumes this host has direct WAN-facing visibility
-   (common when running on a modem in bridge mode). Otherwise the local
-   (private) IP is reported as the WAN IP for transparency, but this case
-   contributes less certainty to the final score than a real UPnP answer.
+## 3. DNS failure vs. no internet
 
-## 7. CGNAT range check (RFC 6598)
+**Function:** `net_dns_resolves`
 
-**Function:** `detect_is_cgnat_range`
+It's possible to have raw IP connectivity (e.g. you can ping `1.1.1.1`)
+while DNS resolution itself is broken. CGNAT Inspector checks this
+separately (via `getent hosts`, falling back to `dig`, falling back to a
+full HTTPS request) and reports a distinct `DNS_FAILURE` status/exit code
+rather than lumping it in with "no internet" -- the fix is different
+(check your resolver configuration) from a genuine outage.
 
-Checks whether the WAN IP falls inside `100.64.0.0/10` -- the address block
-IANA reserved specifically for carrier-grade NAT deployments (RFC 6598).
-**If your WAN IP is in this range, you are behind CGNAT, full stop.** This
-is the single strongest signal and carries the highest score weight (+40).
+## 4. STUN-based public address (independent second opinion)
 
-## 8. RFC 1918 private address check
+**Functions:** `net_stun_get_public_ip`, `stun_query`, `stun_parse_response`
 
-**Function:** `detect_is_private_ipv4`
+In addition to HTTP-based lookups, CGNAT Inspector performs a raw UDP
+[STUN](https://www.rfc-editor.org/rfc/rfc5389) (RFC 5389) Binding Request
+to a public STUN server and parses the XOR-MAPPED-ADDRESS (or legacy
+MAPPED-ADDRESS) attribute from the response. This is implemented in pure
+Bash (`/dev/udp` plus `od`), so it introduces no new required dependency.
 
-Checks whether the WAN IP falls inside any RFC 1918 private range:
+Comparing the STUN-observed address against the HTTP-observed address is
+useful supporting evidence: if they disagree, UDP and TCP/HTTPS traffic
+are very likely taking different NAT bindings, which is common under some
+CGNAT deployments. STUN is always best-effort -- any failure (blocked
+UDP, no `/dev/udp` support, malformed response) simply omits this piece
+of evidence, never a hard error.
 
-- `10.0.0.0/8`
-- `172.16.0.0/12`
-- `192.168.0.0/16`
+## 5. Traceroute analysis (supporting evidence only)
 
-A WAN IP in these ranges (as opposed to a LAN IP, which is expected to be
-private) means there is at least one more layer of NAT between your router
-and the public internet -- your ISP's equipment is handing your router a
-private address instead of a public one. Weighted +30.
-
-## 9. WAN vs. Public IP comparison
-
-**Function:** `detect_wan_matches_public`
-
-Compares the router's reported WAN IP against the publicly-observed IP (as
-seen by the internet). If they differ, there is NAT happening somewhere
-between your router and the public internet that isn't visible to the
-router itself. Weighted +20.
-
-## 10. Traceroute analysis
-
-**Functions:** `tr_run_traceroute`, `tr_has_private_hop_beyond_gateway`
+**Functions:** `tr_run_traceroute`, `tr_analyze`
 
 Runs a short traceroute toward a public anycast address (`1.1.1.1`) and
-inspects each hop beyond your gateway. If any of those early hops are
-*also* private or CGNAT addresses, your traffic is passing through
-ISP-internal NAT infrastructure before it reaches the real internet --
-another classic CGNAT fingerprint. Weighted +10.
+classifies each hop beyond your gateway as private/CGNAT or public,
+tracking:
 
-## 11. Double NAT detection
+- Count of private/CGNAT hops and public hops
+- Whether the path shows a "private backbone" (**two or more** private/
+  CGNAT hops beyond the gateway -- a single private hop is treated as
+  noise, not evidence, to avoid over-weighting a fluke result)
+- Public-to-private and private-to-public transitions along the path
 
-**Function:** `detect_double_nat`
+Traceroute is **never** the sole basis for a CGNAT conclusion; it
+contributes at most 20 of the 100 possible confidence points.
 
-If UPnP is available and the router's *own* reported external IP is itself
-private or CGNAT space, then there is another NAT device between your
-router and the internet (e.g. an ISP modem doing NAT *and* your own router
-also doing NAT). This is reported as a distinct `DOUBLE_NAT` status,
-separate from plain CGNAT, since the fix (bridge mode) is different.
-
-## 12. IPv6 detection
+## 6. IPv6 availability
 
 **Functions:** `net_has_ipv6_route`, `net_get_public_ipv6`
 
-Checks for a usable IPv6 route and, if present, queries an IPv6-only echo
-service. IPv6 traffic on most ISPs bypasses CGNAT entirely (there's enough
-address space that NAT isn't needed), so having working IPv6 is one of the
-most reliable workarounds regardless of your IPv4 situation. This is
-reported informationally and factored into recommendations, not into the
-CGNAT confidence score itself (CGNAT is fundamentally an IPv4 phenomenon).
+CGNAT is fundamentally an IPv4 phenomenon -- most ISPs don't apply it to
+IPv6 traffic, since IPv6's address space doesn't need conserving in the
+same way. A lack of public IPv6 contributes a small amount of uncertainty
+weight (+5) and is called out in recommendations as a possible mitigation
+regardless of your IPv4 CGNAT status.
 
-## Putting it together: confidence scoring
+## The scoring engine
 
-Each boolean signal contributes a fixed weight if true:
+**Function:** `detect_compute_score` (`lib/detect.sh`)
 
-| Signal                              | Weight |
-|--------------------------------------|--------|
-| WAN IP in CGNAT range (100.64/10)   | +40    |
-| WAN IP is RFC1918 private            | +30    |
-| WAN IP differs from public IP        | +20    |
-| Traceroute hop beyond gateway is private/CGNAT | +10 |
+| Signal | Weight | Notes |
+|--------|--------|-------|
+| Router WAN confirmed private/CGNAT | +35 | Strongest single signal |
+| Router WAN could not be determined | +15 | Uncertainty, not evidence of CGNAT |
+| Public IPv4 differs from Router WAN | +20 | Only scored when both are known |
+| Public IPv4 could not be determined | +10 | Uncertainty, not evidence of CGNAT |
+| Traceroute shows a private/CGNAT backbone (>=2 hops) | +20 | Supporting evidence only |
+| STUN-observed address differs from HTTP-observed address | +15 | Only scored when STUN succeeded |
+| No public IPv6 available | +5 | Minor; IPv6 usually bypasses CGNAT anyway |
+| Two or more of the above **strong** signals agree | +10 bonus | "Multiple independent indicators" |
 
-The total (0-100, capped) maps to a label:
+The score is capped at 100. Note the asymmetry: a signal that is
+**unknown** (router WAN or public IP couldn't be determined) scores a
+smaller "uncertainty" weight, not the full "confirmed private/differs"
+weight. This is the key false-positive guard: missing data alone can
+reach at most 25 points (15 + 10), which is comfortably within the
+**Inconclusive** band, never **Possible CGNAT** or **CGNAT Detected**.
 
-| Score  | Label              |
-|--------|--------------------|
-| 0-20   | Probably Public    |
-| 21-50  | Possible CGNAT     |
-| 51-80  | Likely CGNAT       |
-| 81-100 | Confirmed CGNAT    |
+## Status thresholds
 
-Separately, the final **status** (`PUBLIC`, `CGNAT`, `DOUBLE_NAT`,
-`NO_INTERNET`, `ROUTER_UNREACHABLE`) is derived from the same underlying
-booleans via `detect_final_status`, and drives both the exit code and the
-human-readable STATUS line. The numeric confidence score is a supplementary
-signal of *how strong* the evidence is, not the sole basis for the status
-determination.
+| Score | Status |
+|-------|--------|
+| 0-39 | Inconclusive |
+| 40-79 | Possible CGNAT |
+| 80-100 | CGNAT Detected |
+
+## Overall status determination
+
+**Function:** `detect_final_status`
+
+Evaluated in this order (each step short-circuits the ones below it):
+
+1. **No internet, or gateway unreachable** -> `NO_INTERNET` (exit 4).
+   If basic connectivity is broken, nothing else can be determined.
+2. **DNS not resolving** (but connectivity otherwise works) ->
+   `DNS_FAILURE` (exit 5).
+3. **Definitive public confirmation**: the router WAN is known, is *not*
+   private/CGNAT, a public IPv4 was obtained, and the two match ->
+   `PUBLIC` (exit 0), regardless of any leftover uncertainty score from
+   e.g. traceroute noise.
+4. Otherwise, the numeric score (see above) is mapped through the
+   threshold table to `INCONCLUSIVE`, `POSSIBLE_CGNAT`, or
+   `CGNAT_DETECTED`.
+
+## Evidence checklist
+
+**Function:** `detect_build_evidence`
+
+The human-readable "Evidence" section and the JSON `evidence` array are
+both generated from the exact same function, so they can never drift out
+of sync. Each line is a plain boolean statement (✔ = true, ✖ = false);
+comparison-dependent lines (e.g. "Public IPv4 differs from Router WAN")
+are omitted entirely when the comparison wasn't possible, rather than
+misleadingly shown as `false`.

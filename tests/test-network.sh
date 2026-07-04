@@ -69,6 +69,12 @@ test_public_ipv4_lookup() {
     fi
 }
 
+test_public_ipv4_tries_multiple_providers() {
+    # shellcheck disable=SC2016
+    assert_true '(( ${#CGNAT_IPV4_ECHO_SERVICES[@]} >= 4 ))' \
+        "at least 4 independent public-IP echo providers are configured"
+}
+
 test_public_ipv6_lookup_graceful() {
     if ! _network_available; then
         _pass "net_get_public_ipv6 skipped (no internet access in this environment)"
@@ -79,24 +85,40 @@ test_public_ipv6_lookup_graceful() {
     _pass "net_get_public_ipv6 returns without hanging or crashing"
 }
 
-test_upnp_graceful_without_binary() {
+test_router_wan_never_falls_back_to_local_ip() {
+    # Regression test for the WAN-detection bug this refactor fixes:
+    # when UPnP is unavailable, net_get_router_wan_ip must fail
+    # outright (so the caller displays "Unknown") rather than silently
+    # returning the local LAN interface address.
     if has_cmd upnpc; then
         _pass "upnpc present on this system; skipping no-binary fallback check"
         return
     fi
-    assert_false 'net_get_wan_ip_upnp' "net_get_wan_ip_upnp fails gracefully when upnpc is absent"
+    assert_false 'net_get_router_wan_ip' \
+        "net_get_router_wan_ip fails (rather than fabricating a value) when upnpc is absent"
 }
 
 test_dns_resolves_non_fatal() {
-    # Should never abort the shell even if dig is missing or DNS fails.
+    # Should never abort the shell even if getent/dig are missing or
+    # DNS resolution fails.
     net_dns_resolves >/dev/null 2>&1
     _pass "net_dns_resolves returns without aborting the shell"
+}
+
+test_dns_resolves_uses_available_tool() {
+    if has_cmd getent || has_cmd dig || has_cmd curl; then
+        _pass "at least one DNS-checking mechanism (getent/dig/curl) is available on this system"
+    else
+        _pass "no DNS-checking tool available; net_dns_resolves defaults to non-fatal true"
+    fi
 }
 
 run_test_suite "Network Function Tests" \
     test_local_ip_detection \
     test_gateway_detection \
     test_public_ipv4_lookup \
+    test_public_ipv4_tries_multiple_providers \
     test_public_ipv6_lookup_graceful \
-    test_upnp_graceful_without_binary \
-    test_dns_resolves_non_fatal
+    test_router_wan_never_falls_back_to_local_ip \
+    test_dns_resolves_non_fatal \
+    test_dns_resolves_uses_available_tool

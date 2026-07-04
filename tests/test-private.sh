@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/test-private.sh
-# Unit tests for lib/detect.sh classification functions: private IPv4
-# detection, CGNAT range detection, double-NAT detection, confidence
-# scoring, and final status determination.
+# Unit tests for lib/detect.sh: address classification, the
+# evidence-based scoring engine, status determination, exit codes, and
+# recommendations/conclusions.
 
 set -uo pipefail
 
@@ -35,82 +35,210 @@ test_detect_cgnat_range() {
     assert_false 'detect_is_cgnat_range "102.89.44.10"' "public address is not CGNAT range"
 }
 
-test_wan_matches_public() {
-    assert_true 'detect_wan_matches_public "1.2.3.4" "1.2.3.4"' "identical IPs match"
-    assert_false 'detect_wan_matches_public "1.2.3.4" "1.2.3.5"' "different IPs do not match"
-    assert_false 'detect_wan_matches_public "" "1.2.3.5"' "empty WAN never matches"
+test_detect_is_non_public_ipv4() {
+    assert_true 'detect_is_non_public_ipv4 "192.168.1.1"' "RFC1918 counts as non-public"
+    assert_true 'detect_is_non_public_ipv4 "100.91.11.5"' "CGNAT range counts as non-public"
+    assert_false 'detect_is_non_public_ipv4 "102.89.44.10"' "genuine public address is not non-public"
 }
 
-test_double_nat() {
-    assert_true 'detect_double_nat "192.168.1.1"' "private UPnP WAN implies double NAT"
-    assert_true 'detect_double_nat "100.64.1.1"' "CGNAT UPnP WAN implies double NAT"
-    assert_false 'detect_double_nat "102.89.44.10"' "public UPnP WAN implies no double NAT"
-    assert_false 'detect_double_nat ""' "empty UPnP WAN cannot confirm double NAT"
+test_addresses_match() {
+    assert_true 'detect_addresses_match "1.2.3.4" "1.2.3.4"' "identical IPs match"
+    assert_false 'detect_addresses_match "1.2.3.4" "1.2.3.5"' "different IPs do not match"
+    assert_false 'detect_addresses_match "" "1.2.3.5"' "empty address never matches"
 }
 
-test_confidence_scoring() {
+# ---------------------------------------------------------------------------
+# Scoring engine: true positives, false positives, and edge cases
+# ---------------------------------------------------------------------------
+
+test_score_true_positive_cgnat() {
+    # Router WAN confirmed private/CGNAT, public IP differs, traceroute
+    # backbone private, STUN mismatches, no IPv6: every strong signal
+    # agrees -- this should land solidly in CGNAT_DETECTED territory.
     local score
-    score=$(detect_compute_confidence "true" "true" "true" "true")
-    assert_equals "100" "${score}" "all signals true sums to 100 (40+30+20+10)"
+    score=$(detect_compute_score "true" "true" "true" "true" "true" "true" "true" "false")
+    # 35 (private WAN) + 20 (public differs) + 20 (traceroute) + 15 (stun)
+    # + 5 (no ipv6) + 10 (multiple indicators bonus, capped at 100)
+    assert_equals "100" "${score}" "all strong signals true scores at or above 80 (capped at 100)"
 
-    score=$(detect_compute_confidence "false" "false" "false" "false")
-    assert_equals "0" "${score}" "no signals sums to 0"
-
-    score=$(detect_compute_confidence "true" "false" "false" "false")
-    assert_equals "40" "${score}" "CGNAT range alone scores 40"
-
-    score=$(detect_compute_confidence "false" "true" "false" "false")
-    assert_equals "30" "${score}" "private WAN alone scores 30"
-}
-
-test_confidence_labels() {
-    assert_equals "Probably Public" "$(detect_confidence_label 0)" "score 0 label"
-    assert_equals "Probably Public" "$(detect_confidence_label 20)" "score 20 label"
-    assert_equals "Possible CGNAT" "$(detect_confidence_label 21)" "score 21 label"
-    assert_equals "Possible CGNAT" "$(detect_confidence_label 50)" "score 50 label"
-    assert_equals "Likely CGNAT" "$(detect_confidence_label 51)" "score 51 label"
-    assert_equals "Likely CGNAT" "$(detect_confidence_label 80)" "score 80 label"
-    assert_equals "Confirmed CGNAT" "$(detect_confidence_label 81)" "score 81 label"
-    assert_equals "Confirmed CGNAT" "$(detect_confidence_label 100)" "score 100 label"
-}
-
-test_final_status() {
     local status
-    status=$(detect_final_status "false" "false" "false" "false" "true")
-    assert_equals "NO_INTERNET" "${status}" "no internet overrides everything"
+    status=$(detect_status_from_score "${score}")
+    assert_equals "CGNAT_DETECTED" "${status}" "full evidence maps to CGNAT_DETECTED"
+}
 
-    status=$(detect_final_status "true" "false" "false" "false" "false")
-    assert_equals "ROUTER_UNREACHABLE" "${status}" "unreachable gateway"
+test_score_true_negative_public() {
+    # Router WAN known and public, matches public IP, traceroute clean,
+    # STUN agrees, IPv6 available: no evidence of CGNAT anywhere.
+    local score
+    score=$(detect_compute_score "true" "false" "true" "false" "false" "true" "false" "true")
+    assert_equals "0" "${score}" "no negative signals scores 0"
 
-    status=$(detect_final_status "true" "true" "false" "false" "true")
-    assert_equals "CGNAT" "${status}" "CGNAT range triggers CGNAT status"
+    local status
+    status=$(detect_status_from_score "${score}")
+    assert_equals "INCONCLUSIVE" "${status}" "a raw score of 0 falls in the lowest band (main script overrides to PUBLIC via definitive_public)"
+}
 
-    status=$(detect_final_status "true" "false" "true" "false" "true")
-    assert_equals "CGNAT" "${status}" "private WAN triggers CGNAT status"
+test_score_false_positive_guard_missing_data() {
+    # This is the key "avoid false positives" case: we simply don't
+    # know the router WAN or the public IP (e.g. UPnP disabled, ISP
+    # blocking lookup services) but there is NO actual evidence of
+    # CGNAT. This must NOT score high enough to claim CGNAT_DETECTED --
+    # missing data should produce uncertainty (Inconclusive), not a
+    # false accusation.
+    local score
+    score=$(detect_compute_score "false" "false" "false" "false" "false" "false" "false" "true")
+    # 15 (WAN unknown) + 10 (public unavailable) = 25
+    assert_equals "25" "${score}" "missing data alone scores only uncertainty weight"
 
-    status=$(detect_final_status "true" "true" "false" "true" "true")
-    assert_equals "DOUBLE_NAT" "${status}" "double NAT takes priority over plain CGNAT"
+    local status
+    status=$(detect_status_from_score "${score}")
+    assert_equals "INCONCLUSIVE" "${status}" "missing data alone must never reach Possible/Detected"
+}
 
-    status=$(detect_final_status "true" "false" "false" "false" "true")
-    assert_equals "PUBLIC" "${status}" "no negative signals means PUBLIC"
+test_score_single_weak_signal_is_not_detected() {
+    # A single traceroute-only signal (the old tool's biggest false
+    # positive risk) must not, by itself, reach CGNAT_DETECTED.
+    local score
+    score=$(detect_compute_score "false" "false" "false" "false" "true" "false" "false" "true")
+    # 15 (WAN unknown) + 10 (public unavailable) + 20 (traceroute) = 45
+    assert_equals "45" "${score}" "traceroute plus missing data alone scores in the Possible band, not Detected"
+
+    local status
+    status=$(detect_status_from_score "${score}")
+    assert_equals "POSSIBLE_CGNAT" "${status}" "a single strong signal plus uncertainty is Possible, not Detected"
+}
+
+test_score_private_wan_alone() {
+    local score
+    score=$(detect_compute_score "true" "true" "false" "false" "false" "false" "false" "true")
+    # 35 (private WAN) + 10 (public unavailable) = 45
+    assert_equals "45" "${score}" "confirmed private WAN alone (with public IP unavailable) scores 45"
+}
+
+test_score_public_wan_known_edge_case() {
+    # Router WAN is known and public, but public IP lookup failed.
+    # Should not accumulate the "WAN unknown" uncertainty weight since
+    # WAN actually IS known.
+    local score
+    score=$(detect_compute_score "true" "false" "false" "false" "false" "false" "false" "true")
+    assert_equals "10" "${score}" "known-public WAN with unavailable public IP scores only the public-unavailable weight"
+}
+
+test_score_multiple_indicators_bonus_requires_two() {
+    local score
+    # Exactly one strong signal (traceroute) -- no bonus.
+    score=$(detect_compute_score "false" "false" "false" "false" "true" "false" "false" "true")
+    assert_equals "45" "${score}" "one strong signal: no multiple-indicators bonus (15+10+20)"
+
+    # Two strong signals: private WAN + traceroute -- bonus applies.
+    score=$(detect_compute_score "true" "true" "false" "false" "true" "false" "false" "true")
+    # 35 + 10 (public unavailable) + 20 (traceroute) + 10 (bonus) = 75
+    assert_equals "75" "${score}" "two strong signals trigger the +10 multiple-indicators bonus"
+}
+
+test_score_caps_at_100() {
+    local score
+    score=$(detect_compute_score "true" "true" "true" "true" "true" "true" "true" "false")
+    assert_true '(( '"${score}"' <= 100 ))' "score never exceeds 100"
+}
+
+test_status_thresholds() {
+    assert_equals "INCONCLUSIVE" "$(detect_status_from_score 0)" "score 0 -> Inconclusive"
+    assert_equals "INCONCLUSIVE" "$(detect_status_from_score 39)" "score 39 -> Inconclusive"
+    assert_equals "POSSIBLE_CGNAT" "$(detect_status_from_score 40)" "score 40 -> Possible CGNAT"
+    assert_equals "POSSIBLE_CGNAT" "$(detect_status_from_score 79)" "score 79 -> Possible CGNAT"
+    assert_equals "CGNAT_DETECTED" "$(detect_status_from_score 80)" "score 80 -> CGNAT Detected"
+    assert_equals "CGNAT_DETECTED" "$(detect_status_from_score 100)" "score 100 -> CGNAT Detected"
+}
+
+# ---------------------------------------------------------------------------
+# Final status determination (connectivity precedence + definitive PUBLIC)
+# ---------------------------------------------------------------------------
+
+test_final_status_connectivity_precedence() {
+    local status
+    status=$(detect_final_status "false" "false" "false" "false" "90")
+    assert_equals "NO_INTERNET" "${status}" "no internet overrides even a high score"
+
+    status=$(detect_final_status "true" "false" "false" "false" "90")
+    assert_equals "NO_INTERNET" "${status}" "unreachable gateway also maps to NO_INTERNET"
+
+    status=$(detect_final_status "true" "true" "false" "false" "10")
+    assert_equals "DNS_FAILURE" "${status}" "broken DNS with working connectivity is a distinct status"
+}
+
+test_final_status_definitive_public() {
+    local status
+    status=$(detect_final_status "true" "true" "true" "true" "25")
+    assert_equals "PUBLIC" "${status}" "definitive_public short-circuits straight to PUBLIC regardless of leftover score"
+}
+
+test_final_status_score_based() {
+    local status
+    status=$(detect_final_status "true" "true" "true" "false" "10")
+    assert_equals "INCONCLUSIVE" "${status}" "low score with no definitive public confirmation is Inconclusive"
+
+    status=$(detect_final_status "true" "true" "true" "false" "55")
+    assert_equals "POSSIBLE_CGNAT" "${status}" "mid score maps to Possible CGNAT"
+
+    status=$(detect_final_status "true" "true" "true" "false" "85")
+    assert_equals "CGNAT_DETECTED" "${status}" "high score maps to CGNAT Detected"
 }
 
 test_status_exit_codes() {
     assert_equals "0" "$(detect_status_exit_code "PUBLIC")" "PUBLIC -> 0"
-    assert_equals "1" "$(detect_status_exit_code "CGNAT")" "CGNAT -> 1"
-    assert_equals "2" "$(detect_status_exit_code "DOUBLE_NAT")" "DOUBLE_NAT -> 2"
-    assert_equals "3" "$(detect_status_exit_code "NO_INTERNET")" "NO_INTERNET -> 3"
-    assert_equals "4" "$(detect_status_exit_code "MISSING_DEP")" "MISSING_DEP -> 4"
-    assert_equals "5" "$(detect_status_exit_code "ROUTER_UNREACHABLE")" "ROUTER_UNREACHABLE -> 5"
-    assert_equals "6" "$(detect_status_exit_code "SOMETHING_ELSE")" "unknown status -> 6"
+    assert_equals "1" "$(detect_status_exit_code "CGNAT_DETECTED")" "CGNAT_DETECTED -> 1"
+    assert_equals "2" "$(detect_status_exit_code "POSSIBLE_CGNAT")" "POSSIBLE_CGNAT -> 2"
+    assert_equals "3" "$(detect_status_exit_code "INCONCLUSIVE")" "INCONCLUSIVE -> 3"
+    assert_equals "4" "$(detect_status_exit_code "NO_INTERNET")" "NO_INTERNET -> 4"
+    assert_equals "5" "$(detect_status_exit_code "DNS_FAILURE")" "DNS_FAILURE -> 5"
+    assert_equals "6" "$(detect_status_exit_code "INTERNAL_ERROR")" "INTERNAL_ERROR -> 6"
+    assert_equals "6" "$(detect_status_exit_code "SOMETHING_UNEXPECTED")" "unknown status also -> 6 (fail safe)"
 }
 
-run_test_suite "Private / CGNAT Detection Tests" \
+# ---------------------------------------------------------------------------
+# Evidence checklist construction
+# ---------------------------------------------------------------------------
+
+test_build_evidence_omits_unknown_comparisons() {
+    local lines
+    lines=$(detect_build_evidence "true" "true" "true" "false" "false" "false" "false" "false" "false" "false" "false" "false" "true" "false")
+    assert_false 'printf "%s" "'"${lines}"'" | grep -q "Router WAN address is private"' \
+        "evidence omits the private/CGNAT sub-line entirely when router WAN is unknown"
+    assert_false 'printf "%s" "'"${lines}"'" | grep -q "differs from Router WAN"' \
+        "evidence omits the WAN-vs-public comparison line when comparison was not possible"
+    assert_true 'printf "%s" "'"${lines}"'" | grep -q "Router WAN address obtained"' \
+        "evidence always includes whether the router WAN was obtained"
+}
+
+test_build_evidence_includes_known_comparisons() {
+    local lines
+    lines=$(detect_build_evidence "true" "true" "true" "true" "true" "true" "true" "true" "true" "true" "true" "true" "false" "true")
+    assert_true 'printf "%s" "'"${lines}"'" | grep -q "Router WAN address is private or CGNAT range"' \
+        "evidence includes the private/CGNAT line when router WAN is known"
+    assert_true 'printf "%s" "'"${lines}"'" | grep -q "differs from Router WAN"' \
+        "evidence includes the WAN-vs-public comparison when both are known"
+    assert_true 'printf "%s" "'"${lines}"'" | grep -q "STUN-observed address differs"' \
+        "evidence includes the STUN comparison line when STUN succeeded"
+}
+
+run_test_suite "Evidence-Based Detection Tests" \
     test_detect_private_ipv4 \
     test_detect_cgnat_range \
-    test_wan_matches_public \
-    test_double_nat \
-    test_confidence_scoring \
-    test_confidence_labels \
-    test_final_status \
-    test_status_exit_codes
+    test_detect_is_non_public_ipv4 \
+    test_addresses_match \
+    test_score_true_positive_cgnat \
+    test_score_true_negative_public \
+    test_score_false_positive_guard_missing_data \
+    test_score_single_weak_signal_is_not_detected \
+    test_score_private_wan_alone \
+    test_score_public_wan_known_edge_case \
+    test_score_multiple_indicators_bonus_requires_two \
+    test_score_caps_at_100 \
+    test_status_thresholds \
+    test_final_status_connectivity_precedence \
+    test_final_status_definitive_public \
+    test_final_status_score_based \
+    test_status_exit_codes \
+    test_build_evidence_omits_unknown_comparisons \
+    test_build_evidence_includes_known_comparisons

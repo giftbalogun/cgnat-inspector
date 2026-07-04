@@ -69,7 +69,9 @@ has_cmd() {
 }
 
 # check_required_deps verifies all hard dependencies are present.
-# Exits with CGNAT_EXIT_MISSING_DEP (4) if any are missing.
+# Exits with CGNAT_EXIT_INTERNAL_ERROR (6) if any are missing -- the
+# current exit code table has no separate "missing dependency" code,
+# so this is treated as an internal/environment error.
 check_required_deps() {
     local missing=0
     local deps=(bash curl ip awk grep sed)
@@ -84,7 +86,7 @@ check_required_deps() {
 
     if [[ "${missing}" -eq 1 ]]; then
         log_error "One or more required dependencies are missing. Aborting."
-        exit "${CGNAT_EXIT_MISSING_DEP:-4}"
+        exit "${CGNAT_EXIT_INTERNAL_ERROR:-6}"
     fi
 }
 

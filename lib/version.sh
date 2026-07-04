@@ -8,7 +8,7 @@ if [[ -n "${CGNAT_VERSION_LOADED:-}" ]]; then
 fi
 CGNAT_VERSION_LOADED=1
 
-readonly CGNAT_VERSION="1.0.0"
+readonly CGNAT_VERSION="1.1.0"
 readonly CGNAT_NAME="CGNAT Inspector"
 # shellcheck disable=SC2034  # consumed by cgnat-inspector's print_help()
 readonly CGNAT_REPO_URL="https://github.com/giftbalogun/cgnat-inspector"

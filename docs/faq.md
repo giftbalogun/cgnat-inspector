@@ -34,18 +34,48 @@ control since it happens on ISP equipment.
 
 The `100.64.0.0/10` block (100.64.0.0 - 100.127.255.255) is reserved
 specifically for carrier-grade NAT under RFC 6598 and is never valid as a
-public internet address. If your router's WAN IP is in this range, yes,
-you are behind CGNAT.
+public internet address. If your **router's WAN** address (not your LAN
+address) is in this range, yes, you are behind CGNAT -- CGNAT Inspector
+scores this as the strongest single signal (+35 of the 100 possible
+points) and will only need one or two more corroborating signals to
+report a `CGNAT Detected` result.
 
 ### My WAN IP starts with 10, 172.16-31, or 192.168. Is that CGNAT too?
 
 Those are RFC 1918 *private* ranges, not the RFC 6598 CGNAT range
 specifically -- but seeing one of them as your *router's WAN* address
 (as opposed to your LAN) still means there's another NAT layer between
-your router and the internet. CGNAT Inspector flags this as
-`private_wan: true` and treats it as a strong CGNAT/double-NAT signal,
-even though it's technically a different address block than the "official"
-CGNAT range.
+your router and the internet. CGNAT Inspector scores this the same way it
+scores a genuine CGNAT-range address.
+
+### Why does the tool say "Possible CGNAT" instead of just telling me yes or no?
+
+CGNAT Inspector deliberately avoids jumping straight to a confident
+"CGNAT Detected" conclusion from a single piece of evidence, since a
+single signal (e.g. only a suspicious traceroute hop, with everything
+else unknown) isn't strong enough proof on its own and risks a false
+positive. It reports three tiers instead:
+
+- **Inconclusive** (confidence 0-39%): not enough evidence either way,
+  often because UPnP is disabled or the WAN/public IP couldn't be
+  determined.
+- **Possible CGNAT** (40-79%): some solid evidence, but not enough
+  independent signals agree yet.
+- **CGNAT Detected** (80-100%): multiple independent signals agree.
+
+See `docs/how-it-works.md` for the full scoring breakdown.
+
+### What is STUN, and why does the tool use it?
+
+STUN (RFC 5389) is a lightweight protocol for discovering your public IP
+address via a raw UDP round trip to a public STUN server, independent of
+the HTTP-based "what's my IP" services. If the STUN-observed address
+disagrees with the HTTP-observed one, that's a sign that different
+traffic types (UDP vs. TCP/HTTPS) are taking different paths through your
+ISP's NAT infrastructure -- itself a useful CGNAT signal. It's entirely
+optional, best-effort evidence: if it fails for any reason (blocked UDP,
+no STUN server reachable), it's simply omitted, never treated as an
+error.
 
 ### Can I fix CGNAT myself?
 
@@ -75,10 +105,12 @@ guessing at the rest.
 ### Does this tool send any of my data anywhere?
 
 CGNAT Inspector makes outbound requests only to: public IP echo services
-(ipify.org, ifconfig.me, icanhazip.com, ident.me), well-known ping targets
-(1.1.1.1, 8.8.8.8, 9.9.9.9), and your own local router (for UPnP queries).
-It does not send telemetry to any project-controlled server -- there isn't
-one. Everything runs locally on your machine.
+(ipify.org, ifconfig.me, icanhazip.com, checkip.amazonaws.com, ident.me),
+a public STUN server (a single UDP round trip, used only to cross-check
+your public address), well-known ping targets (1.1.1.1, 8.8.8.8, 9.9.9.9),
+and your own local router (for UPnP queries). It does not send telemetry
+to any project-controlled server -- there isn't one. Everything runs
+locally on your machine.
 
 ### Why isn't `jq`/`ipcalc`/`miniupnpc` required?
 
@@ -90,12 +122,15 @@ opportunistically to pretty-print JSON if it happens to be present, and
 `upnpc`/`ipcalc`/`dig` are used only to *improve* accuracy when available,
 never required.
 
-### The tool says "WAN differs from Public IP" but I'm not behind CGNAT. Why?
+### The tool says "Public IPv4 differs from Router WAN" but I'm not behind CGNAT. Why?
 
 This can happen with certain VPN configurations, if UPnP is reporting a
 stale cached value, or on networks with asymmetric/policy routing. Try
-running with `--no-upnp` to fall back to the simpler heuristic, and
-`--verbose` to see each intermediate value the tool gathered.
+running with `--no-upnp` (so this comparison isn't made at all -- it's
+only ever scored when both addresses are actually known) and `--verbose`
+to see each intermediate value the tool gathered. A single differing
+comparison alone will land you in "Possible CGNAT" territory at most, not
+"CGNAT Detected" -- that requires at least one more corroborating signal.
 
 ### Can I run this on a router directly (e.g. via OpenWrt)?
 

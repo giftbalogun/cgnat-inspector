@@ -53,18 +53,29 @@ it can be unit tested in isolation.
   `lib/utils.sh` already do this -- keep it that way so `--json` output
   stays parseable even with `--verbose`/`--debug` enabled.
 
-## Adding a new detection signal
+## Adding a new evidence signal
 
 1. Add the raw data-gathering function to `lib/network.sh` or
    `lib/traceroute.sh` (whichever fits).
-2. Add the classification/scoring logic to `lib/detect.sh`. If it affects
-   the confidence score, add a new `SCORE_*` constant and document the
+2. Add a `SCORE_*` weight constant to `lib/detect.sh` and fold it into
+   `detect_compute_score`. Follow the existing pattern: a *known and
+   true* signal scores its full weight; an *unknown* signal scores a
+   smaller "uncertainty" weight (never the same as a confirmed positive
+   -- that's the project's core false-positive guard). Document the
    weight in `docs/how-it-works.md`.
-3. Wire it into `cgnat-inspector`'s `main()` function.
-4. Add the new field to `lib/json.sh`'s `json_build_report` and document it
-   in `docs/api.md`.
-5. Add tests to the relevant `tests/test-*.sh` file.
-6. Update `README.md`'s feature list and `CHANGELOG.md` under
+3. Add the corresponding line(s) to `detect_build_evidence`, using
+   conditional inclusion (see existing examples) if the line only makes
+   sense when certain other data is known.
+4. Wire the raw fact and its classification into `cgnat-inspector`'s
+   `main()` function.
+5. `lib/json.sh`'s evidence/array helpers already consume
+   `detect_build_evidence`'s output generically -- no JSON changes are
+   usually needed unless you're adding an entirely new top-level field.
+6. Add tests to `tests/test-private.sh` (scoring/status) and, if the
+   signal comes from a new parsing routine, a dedicated test file (see
+   `tests/test-stun.sh` for the pattern of testing wire-format parsing
+   with hand-crafted fixtures, with no live network required).
+7. Update `README.md`'s feature list and `CHANGELOG.md` under
    `[Unreleased]`.
 
 ## Adding a new CLI flag
@@ -82,11 +93,13 @@ bash tests/test-private.sh          # run a single suite
 ```
 
 - `tests/test-ipcalc.sh` -- pure IP arithmetic (`ip_in_cidr`, `ip_to_int`, etc.)
-- `tests/test-private.sh` -- CGNAT/private classification, scoring, status logic
-- `tests/test-json.sh` -- JSON escaping and report assembly
+- `tests/test-private.sh` -- address classification, the evidence-based scoring engine, status/exit-code logic
+- `tests/test-json.sh` -- JSON escaping and report assembly (including the evidence array)
 - `tests/test-network.sh` -- network functions; live-network checks are
   skipped gracefully (not failed) when the CI runner has no internet
   access, but local/offline-safe checks always run
+- `tests/test-stun.sh` -- the pure-Bash STUN response parser, using
+  hand-crafted byte fixtures (no live network required)
 
 When adding a test, prefer `assert_true`/`assert_false`/`assert_equals`
 from `tests/test-framework.sh` over hand-rolled `if` statements, and give

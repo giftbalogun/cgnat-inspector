@@ -7,65 +7,75 @@
 [![Bash](https://img.shields.io/badge/Bash-5.x-4EAA25?logo=gnu-bash&logoColor=white)](https://www.gnu.org/software/bash/)
 
 CGNAT Inspector is a dependency-light Linux CLI tool that answers one
-question with confidence, not guesswork: **"Am I behind Carrier Grade
-NAT?"** It runs several independent tests -- WAN-vs-public IP comparison,
-RFC 6598/RFC 1918 range checks, traceroute hop analysis, and UPnP-based
-double-NAT detection -- and combines them into a weighted confidence score,
-instead of relying on any single signal.
+question with **evidence, not guesswork**: "Am I behind Carrier Grade
+NAT?" It runs several independent tests -- router WAN inspection via
+UPnP, multi-provider public IP lookups, STUN cross-checks, RFC 6598/RFC
+1918 range checks, and traceroute backbone analysis -- and combines them
+into a weighted confidence score. It never concludes CGNAT from a single
+signal, and it never reports a guessed value as if it were confirmed.
 
 ```
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
       CGNAT Inspector v1.0.0
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 Network Information
 
-Local IP:
-192.168.1.10
+LAN IP:
+192.168.1.15
 
 Gateway:
 192.168.1.1
 
-WAN:
-100.91.11.5
+Router WAN:
+100.91.0.22
 
 Public IPv4:
-100.77.33.66
+102.89.44.10
 
 IPv6:
 Not Available
 
-----------------------------------------
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Tests
+Assessment
 
-✔ Internet reachable
-✔ Gateway reachable
-✖ WAN is private
-✖ WAN is CGNAT
-✔ Public IPv4 detected
-✖ WAN differs from Public IP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-----------------------------------------
+Status
 
-Result
-
-STATUS
-
-CGNAT DETECTED
+CGNAT Detected
 
 Confidence
 
-95%  (Confirmed CGNAT)
+95%
+
+Evidence
+
+✔ Internet connectivity confirmed
+✔ Default gateway reachable
+✔ DNS resolution working
+✔ Router WAN address obtained
+✔ Router WAN address is private or CGNAT range
+✔ Public IPv4 address obtained
+✔ Public IPv4 differs from Router WAN
+✔ Traceroute shows a private/CGNAT backbone
+✖ Public IPv6 available
+✔ Multiple independent indicators corroborate
+
+Conclusion
+
+The available evidence strongly indicates this connection is behind
+Carrier-Grade NAT.
 
 Recommendations
 
 • Request a Public IPv4 address from your ISP
 • Use Tailscale or another WireGuard-based mesh VPN for inbound access
 • Use Cloudflare Tunnel to expose services without port forwarding
-• Consider a cheap VPS with a public IP as a reverse-proxy relay
+• Use a VPS reverse proxy as a relay for inbound connections
 • Enable IPv6 if your ISP supports it; IPv6 traffic typically bypasses CGNAT entirely
 
 Exit Code
@@ -92,35 +102,47 @@ Exit Code
 
 ## Overview
 
-If you self-host anything at home, a game server, Plex, a security
-camera NVR, a personal website and inbound connections mysteriously
+If you self-host anything at home -- a game server, Plex, a security
+camera NVR, a personal website -- and inbound connections mysteriously
 don't work despite correct port forwarding, there's a good chance your ISP
 has put you behind Carrier Grade NAT (CGNAT). CGNAT Inspector diagnoses
-this quickly and explains *why*, rather than leaving you to guess based on
-a single "what's my IP" website.
+this quickly and explains *why*, showing you the actual evidence rather
+than a black-box yes/no.
 
 It's built as a modular, testable, ShellCheck-clean Bash project (not a
-single monolithic script), suitable for public release, packaging, and
-long-term maintenance. See [`docs/how-it-works.md`](docs/how-it-works.md)
-for a full technical explanation of every test.
+single monolithic script), with detection, scoring, reporting, and
+networking kept in separate files so each can be understood and unit
+tested independently. See
+[`docs/how-it-works.md`](docs/how-it-works.md) for the full technical
+explanation, including the scoring weights.
 
 ## Features
 
+- ✅ Correctly distinguishes **LAN IP**, **Gateway**, **Router WAN**
+  (UPnP-only, never guessed from the local interface), and **Public
+  IPv4**
 - ✅ Detect Carrier Grade NAT (RFC 6598, `100.64.0.0/10`)
-- ✅ Detect Double NAT (via UPnP router WAN IP query)
-- ✅ Compare router WAN IP vs. publicly observed IP
-- ✅ Detect private WAN address (RFC 1918)
-- ✅ Detect RFC 1918 private ranges generally
+- ✅ Detect a private/CGNAT router WAN address (RFC 1918 + RFC 6598)
+- ✅ Multi-provider public IPv4 lookup (5 independent services, with
+  retries) -- reports `Unavailable` (not a misleading `Unknown`) only
+  after every provider fails
+- ✅ STUN (RFC 5389) cross-check of your public address, independent of
+  HTTP-based lookups, implemented in pure Bash
+- ✅ Traceroute backbone analysis (multiple private/CGNAT hops, path
+  transitions) -- used only as supporting evidence, never the sole basis
+  for a conclusion
+- ✅ Distinct `DNS_FAILURE` status, separate from "no internet"
 - ✅ Detect IPv6 availability and public IPv6 address
-- ✅ Detect internet connectivity (with non-ICMP fallback)
-- ✅ Traceroute analysis for private/CGNAT hops beyond your gateway
-- ✅ UPnP WAN detection
-- ✅ Gateway detection and reachability check
-- ✅ Local network detection
-- ✅ Automatic optional-dependency checking (never hard-fails on missing extras)
-- ✅ Weighted confidence score (0-100) with labeled bands
-- ✅ Actionable recommendations based on your specific result
-- ✅ Human-readable colorized output *and* machine-readable `--json` output
+- ✅ **Evidence-based confidence scoring** (0-100): missing data
+  contributes uncertainty, never false-positive evidence
+- ✅ Three-tier status: `Inconclusive` / `Possible CGNAT` / `CGNAT
+  Detected` -- never a confident conclusion from weak evidence
+- ✅ Full evidence checklist and a plain-English conclusion sentence in
+  every report
+- ✅ Human-readable colorized output *and* machine-readable `--json`
+  output
+- ✅ Automatic optional-dependency checking (never hard-fails on missing
+  extras)
 - ✅ Documented exit codes for scripting/automation
 
 ## Installation
@@ -172,9 +194,10 @@ never hard-fails because an optional tool is absent):
 |------|---------|--------------------|
 | `traceroute` | Hop-level path analysis | Traceroute section/signal skipped |
 | `ipcalc` | *(not required)* | Tool uses its own pure-Bash IP arithmetic |
-| `miniupnpc` (`upnpc`) | Router WAN IP via UPnP, double-NAT detection | Falls back to a local-IP heuristic |
+| `miniupnpc` (`upnpc`) | Router WAN IP via UPnP | Router WAN reported as `Unknown` |
 | `jq` | Pretty-printing JSON in tests/tooling | JSON is still emitted validly without it |
-| `dig` | DNS sanity check | Skipped (non-fatal) |
+| `dig` | DNS sanity check | Falls back to `getent`/`curl` |
+| `od` | STUN response parsing (coreutils; essentially always present) | STUN evidence skipped |
 
 ## Usage
 
@@ -201,36 +224,45 @@ cgnat-inspector
 | `--ipv4-only` | Skip all IPv6 tests |
 | `--ipv6-only` | Skip IPv4 public-address lookup (CGNAT detection itself is inherently IPv4) |
 | `--traceroute` | Force traceroute analysis even if it would otherwise be skipped, and include raw hop data in JSON output |
-| `--no-upnp` | Skip UPnP router WAN IP / double-NAT detection |
+| `--no-upnp` | Skip UPnP router WAN IP query |
 
 ## Detection logic
 
-CGNAT Inspector runs independent tests and combines them -- see
-[`docs/how-it-works.md`](docs/how-it-works.md) for the full explanation of
-each one. Summary:
+CGNAT Inspector gathers independent signals and combines them into a
+weighted confidence score -- see
+[`docs/how-it-works.md`](docs/how-it-works.md) for the full breakdown.
+Summary:
 
-1. **CGNAT range check** -- is the router's WAN IP in `100.64.0.0/10`?
-2. **RFC 1918 private WAN check** -- is the WAN IP itself private (not just your LAN)?
-3. **WAN vs. Public IP** -- does your router's WAN IP match what the internet sees?
-4. **Traceroute hop analysis** -- are hops beyond your gateway still private/CGNAT space?
-5. **Double NAT check** -- does your router's own UPnP-reported external IP indicate another NAT layer upstream?
-6. **IPv6 availability** -- informational; often a workaround regardless of your CGNAT status.
+1. **Router WAN inspection** (UPnP only) -- is it private/CGNAT space?
+2. **Public IPv4 lookup** (5 providers) -- does it differ from the Router WAN?
+3. **STUN cross-check** -- does the UDP-observed address differ from the HTTP-observed one?
+4. **Traceroute backbone analysis** -- are 2+ hops beyond your gateway still private/CGNAT space?
+5. **IPv6 availability** -- informational; often a workaround regardless of your CGNAT status.
 
 ### Confidence scoring
 
 | Signal | Weight |
 |--------|--------|
-| WAN in CGNAT range | +40 |
-| Private WAN | +30 |
-| WAN differs from public IP | +20 |
-| Private traceroute hop | +10 |
+| Router WAN confirmed private/CGNAT | +35 |
+| Router WAN could not be determined | +15 |
+| Public IPv4 differs from Router WAN | +20 |
+| Public IPv4 could not be determined | +10 |
+| Traceroute shows a private/CGNAT backbone | +20 |
+| STUN-observed address differs from HTTP-observed address | +15 |
+| No public IPv6 available | +5 |
+| Two or more strong signals agree (bonus) | +10 |
 
-| Score | Label |
-|-------|-------|
-| 0-20 | Probably Public |
-| 21-50 | Possible CGNAT |
-| 51-80 | Likely CGNAT |
-| 81-100 | Confirmed CGNAT |
+| Score | Status |
+|-------|--------|
+| 0-39 | Inconclusive |
+| 40-79 | Possible CGNAT |
+| 80-100 | CGNAT Detected |
+
+Missing data (Router WAN or Public IPv4 unavailable) always scores its
+smaller uncertainty weight, never the full "confirmed" weight -- this is
+the core false-positive guard. A definitive `PUBLIC` result additionally
+requires the Router WAN to be known, non-private, and matching the
+Public IPv4 -- not just a low score.
 
 ## JSON output
 
@@ -240,21 +272,22 @@ cgnat-inspector --json
 
 ```json
 {
-  "status": "CGNAT",
-  "confidence": 95,
+  "status": "POSSIBLE_CGNAT",
+  "confidence": 55,
   "local_ip": "192.168.1.15",
   "gateway": "192.168.1.1",
-  "wan_ip": "100.91.0.22",
-  "public_ip": "102.89.44.10",
+  "router_wan": null,
+  "public_ip": null,
   "ipv6": null,
-  "private_wan": true,
-  "cgnat": true,
-  "double_nat": false,
-  "traceroute_private": true,
+  "evidence": [
+    { "description": "Internet connectivity confirmed", "present": true },
+    { "description": "Router WAN address obtained", "present": false },
+    { "description": "Traceroute shows a private/CGNAT backbone", "present": true }
+  ],
+  "conclusion": "The available evidence suggests the connection may be behind Carrier-Grade NAT. Additional information (such as the router WAN address or a confirmed public IPv4) is required before making a definitive determination.",
   "recommendations": [
     "Request a Public IPv4 address from your ISP",
-    "Use Tailscale or another WireGuard-based mesh VPN for inbound access",
-    "Use Cloudflare Tunnel to expose services without port forwarding"
+    "Use Tailscale or another WireGuard-based mesh VPN for inbound access"
   ]
 }
 ```
@@ -282,9 +315,9 @@ cgnat-inspector --verbose
 
 # Use in a script based on exit code
 if cgnat-inspector --quiet; then
-    echo "You have a public IP."
+    echo "You have a confirmed public IP."
 else
-    echo "Some form of NAT/CGNAT detected (exit code $?)."
+    echo "Some form of NAT/CGNAT (or connectivity issue) detected (exit code $?)."
 fi
 ```
 
@@ -292,25 +325,26 @@ fi
 
 | Code | Meaning |
 |------|---------|
-| 0 | Public IP |
-| 1 | CGNAT |
-| 2 | Double NAT |
-| 3 | Internet unreachable |
-| 4 | Missing dependency |
-| 5 | Router unreachable |
-| 6 | Unknown error |
+| 0 | Public IPv4 confirmed (No CGNAT) |
+| 1 | CGNAT Detected |
+| 2 | Possible CGNAT |
+| 3 | Inconclusive |
+| 4 | Internet unreachable |
+| 5 | DNS failure |
+| 6 | Internal error |
 
 ## Troubleshooting
 
 See [`docs/troubleshooting.md`](docs/troubleshooting.md) for solutions to
-common issues (missing dependencies, blocked ICMP, UPnP not responding,
-empty traceroute, etc.).
+common issues (missing dependencies, blocked ICMP, DNS failures, UPnP not
+responding, empty traceroute, STUN not resolving, etc.).
 
 ## FAQ
 
 See [`docs/faq.md`](docs/faq.md) for answers to common questions about
-what CGNAT is, whether it can be fixed on your end, and what data this
-tool sends (and doesn't send) over the network.
+what CGNAT is, why the tool reports "Possible CGNAT" instead of a
+confident yes/no, what STUN is for, and what data this tool sends (and
+doesn't send) over the network.
 
 ## Screenshots
 
@@ -322,7 +356,7 @@ ranges) are welcome via PR.
 
 Contributions are welcome! Please read
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the project layout, code style,
-and how to add a new detection signal, CLI flag, or test. Every change
+and how to add a new evidence signal, CLI flag, or test. Every change
 should keep the project ShellCheck-clean and pass `./tests/run-tests.sh`.
 
 ## License

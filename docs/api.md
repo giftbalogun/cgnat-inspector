@@ -26,28 +26,37 @@ gives you clean, parseable output.
 
 ```json
 {
-  "status": "CGNAT",
-  "confidence": 95,
+  "status": "POSSIBLE_CGNAT",
+  "confidence": 55,
   "local_ip": "192.168.1.15",
   "gateway": "192.168.1.1",
-  "wan_ip": "100.91.0.22",
-  "public_ip": "102.89.44.10",
+  "router_wan": null,
+  "public_ip": null,
   "ipv6": null,
-  "private_wan": true,
-  "cgnat": true,
-  "double_nat": false,
-  "traceroute_private": true,
+  "evidence": [
+    { "description": "Internet connectivity confirmed", "present": true },
+    { "description": "Default gateway reachable", "present": true },
+    { "description": "DNS resolution working", "present": true },
+    { "description": "Router WAN address obtained", "present": false },
+    { "description": "Public IPv4 address obtained", "present": false },
+    { "description": "Traceroute shows a private/CGNAT backbone", "present": true },
+    { "description": "Public IPv6 available", "present": false },
+    { "description": "Multiple independent indicators corroborate", "present": false }
+  ],
+  "conclusion": "The available evidence suggests the connection may be behind Carrier-Grade NAT. Additional information (such as the router WAN address or a confirmed public IPv4) is required before making a definitive determination.",
   "recommendations": [
     "Request a Public IPv4 address from your ISP",
     "Use Tailscale or another WireGuard-based mesh VPN for inbound access",
     "Use Cloudflare Tunnel to expose services without port forwarding",
-    "Consider a cheap VPS with a public IP as a reverse-proxy relay"
+    "Use a VPS reverse proxy as a relay for inbound connections",
+    "Enable IPv6 if your ISP supports it; IPv6 traffic typically bypasses CGNAT entirely"
   ]
 }
 ```
 
 When `--traceroute` is passed, an additional `traceroute` field is
-included:
+included (and omitted entirely otherwise -- check `has("traceroute")`
+rather than assuming an empty array):
 
 ```json
 {
@@ -62,21 +71,19 @@ included:
 
 ### Field reference
 
-| Field                 | Type            | Description |
-|------------------------|-----------------|-------------|
-| `status`               | string          | One of `PUBLIC`, `CGNAT`, `DOUBLE_NAT`, `NO_INTERNET`, `ROUTER_UNREACHABLE`. |
-| `confidence`            | integer (0-100) | Weighted CGNAT confidence score. See `docs/how-it-works.md`. |
-| `local_ip`              | string or null  | This machine's local IPv4 address. |
-| `gateway`               | string or null  | Default gateway IPv4 address. |
-| `wan_ip`                | string or null  | Router's WAN-facing IPv4 address (via UPnP if available, otherwise a heuristic fallback). |
-| `public_ip`             | string or null  | Publicly observed IPv4 address, as seen by external echo services. |
-| `ipv6`                  | string or null  | Public IPv6 address, if available; `null` otherwise. |
-| `private_wan`           | boolean         | `true` if `wan_ip` falls in an RFC1918 private range. |
-| `cgnat`                 | boolean         | `true` if `wan_ip` falls in `100.64.0.0/10` (RFC 6598). |
-| `double_nat`            | boolean         | `true` if the router's own UPnP-reported external IP is itself private/CGNAT. |
-| `traceroute_private`    | boolean         | `true` if any traceroute hop beyond the gateway is private/CGNAT space. |
-| `traceroute`            | array (optional)| Present only with `--traceroute`. Array of `{"hop": N, "ip": "..."}`. |
-| `recommendations`       | array of strings| Human-readable suggested next steps based on the result. |
+| Field | Type | Description |
+|-------|------|--------------|
+| `status` | string | One of `PUBLIC`, `CGNAT_DETECTED`, `POSSIBLE_CGNAT`, `INCONCLUSIVE`, `NO_INTERNET`, `DNS_FAILURE`, `INTERNAL_ERROR`. |
+| `confidence` | integer (0-100) | Evidence-based confidence score. `0` for `PUBLIC`, `NO_INTERNET`, and `DNS_FAILURE` (the score isn't meaningful for those statuses). See `docs/how-it-works.md`. |
+| `local_ip` | string or null | This machine's LAN-side IPv4 address. |
+| `gateway` | string or null | Default gateway IPv4 address. |
+| `router_wan` | string or null | Router's real WAN-facing IPv4 address, obtained **only** via UPnP. `null` means genuinely unknown (`--no-upnp`, UPnP unavailable/disabled) -- it is never filled in with the LAN address. |
+| `public_ip` | string or null | Publicly observed IPv4 address (HTTP echo services). `null` means every provider failed ("Unavailable"). |
+| `ipv6` | string or null | Public IPv6 address, if available. |
+| `evidence` | array of objects | `{"description": string, "present": boolean}`. Comparison-dependent items (e.g. WAN-vs-public) are omitted entirely when the comparison wasn't possible. |
+| `traceroute` | array (optional) | Present only with `--traceroute`. Array of `{"hop": N, "ip": "..."}`. |
+| `conclusion` | string | One-sentence, human-readable explanation of the status. |
+| `recommendations` | array of strings | Suggested next steps based on the result. |
 
 ## Exit codes
 
@@ -84,15 +91,15 @@ included:
 `$?` after the call for scripting, no need to parse the `status` field if
 you just need a pass/fail signal:
 
-| Code | Meaning              |
-|------|----------------------|
-| 0    | Public IP            |
-| 1    | CGNAT                |
-| 2    | Double NAT           |
-| 3    | Internet unreachable |
-| 4    | Missing dependency   |
-| 5    | Router unreachable   |
-| 6    | Unknown error        |
+| Code | Meaning |
+|------|---------|
+| 0 | Public IPv4 confirmed (No CGNAT) |
+| 1 | CGNAT Detected |
+| 2 | Possible CGNAT |
+| 3 | Inconclusive |
+| 4 | Internet unreachable |
+| 5 | DNS failure |
+| 6 | Internal error |
 
 ## Example: shell scripting
 
@@ -101,9 +108,12 @@ you just need a pass/fail signal:
 result=$(cgnat-inspector --json 2>/dev/null)
 status=$(echo "$result" | jq -r '.status')
 
-if [[ "$status" == "CGNAT" ]]; then
+if [[ "$status" == "CGNAT_DETECTED" ]]; then
     echo "CGNAT detected -- falling back to Cloudflare Tunnel"
     systemctl start cloudflared
+elif [[ "$status" == "POSSIBLE_CGNAT" ]]; then
+    echo "Possible CGNAT -- see evidence for details:"
+    echo "$result" | jq -r '.evidence[] | "\(.description): \(.present)"'
 fi
 ```
 
@@ -116,8 +126,8 @@ fi
 
 ## Notes on stability
 
-The JSON schema is considered stable as of v1.0.0: existing fields will
-not be removed or change type in a minor/patch release. New fields may be
-added. Always parse the response as an object and access fields by name
-(e.g. via `jq`) rather than relying on field order or an exact byte-for-byte
-match.
+The JSON schema is considered stable as of the current release: existing
+fields will not be removed or change type in a minor/patch release. New
+fields may be added, and the set of `status` values may grow. Always
+parse the response as an object and access fields by name (e.g. via `jq`)
+rather than relying on field order or an exact byte-for-byte match.

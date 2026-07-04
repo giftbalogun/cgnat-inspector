@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # tests/test-json.sh
-# Unit tests for lib/json.sh: escaping, string/bool/array encoding, and
-# full report assembly. Where available, `jq` is used to validate that
-# output is actually well-formed JSON, not just visually plausible.
+# Unit tests for lib/json.sh: escaping, string/bool/array/evidence
+# encoding, and full report assembly. Where available, `jq` is used to
+# validate that output is actually well-formed JSON, not just visually
+# plausible.
 
 set -uo pipefail
 
@@ -50,13 +51,39 @@ test_json_array_of_strings() {
     assert_equals '["only"]' "${result}" "single-item array"
 }
 
+test_json_array_of_hops() {
+    local input
+    input=$(printf '1 192.168.1.1\n2 100.91.0.1\n')
+    local result
+    result=$(json_array_of_hops "${input}")
+    assert_equals '[{"hop":1,"ip":"192.168.1.1"},{"hop":2,"ip":"100.91.0.1"}]' "${result}" \
+        "two-hop traceroute array"
+
+    result=$(json_array_of_hops "")
+    assert_equals '[]' "${result}" "empty traceroute input produces empty array"
+}
+
+test_json_array_of_evidence() {
+    local input
+    input=$(printf 'Internet connectivity confirmed\ttrue\nRouter WAN address obtained\tfalse\n')
+    local result
+    result=$(json_array_of_evidence "${input}")
+    assert_equals '[{"description":"Internet connectivity confirmed","present":true},{"description":"Router WAN address obtained","present":false}]' \
+        "${result}" "two-item evidence array with mixed booleans"
+
+    result=$(json_array_of_evidence "")
+    assert_equals '[]' "${result}" "empty evidence input produces empty array"
+}
+
 test_json_build_report_is_valid() {
     local recs
-    recs=$(printf 'Request Public IPv4\nUse IPv6\n')
+    recs=$(printf 'Request a Public IPv4 address from your ISP\nEnable IPv6 if available\n')
+    local evidence
+    evidence=$(printf 'Internet connectivity confirmed\ttrue\nRouter WAN address obtained\tfalse\n')
 
     local output
-    output=$(json_build_report "CGNAT" 95 "192.168.1.15" "192.168.1.1" \
-        "100.91.0.22" "102.1.2.3" "" "true" "true" "false" "true" "${recs}")
+    output=$(json_build_report "POSSIBLE_CGNAT" 55 "192.168.1.15" "192.168.1.1" \
+        "" "" "" "${evidence}" "The evidence suggests possible CGNAT." "${recs}")
 
     assert_not_empty "${output}" "report is non-empty"
 
@@ -64,31 +91,52 @@ test_json_build_report_is_valid() {
         assert_true "printf '%s' '${output}' | jq -e . >/dev/null 2>&1" "report is valid JSON (validated via jq)"
         local status
         status=$(printf '%s' "${output}" | jq -r '.status')
-        assert_equals "CGNAT" "${status}" "jq extracts correct status field"
+        assert_equals "POSSIBLE_CGNAT" "${status}" "jq extracts correct status field"
+        local router_wan
+        router_wan=$(printf '%s' "${output}" | jq -r '.router_wan')
+        assert_equals "null" "${router_wan}" "unknown router_wan becomes JSON null"
+        local evidence_count
+        evidence_count=$(printf '%s' "${output}" | jq '.evidence | length')
+        assert_equals "2" "${evidence_count}" "evidence array has the expected item count"
     else
-        # Fallback structural check without jq: braces balance and key
-        # fields are present. These assertions intentionally pass a
-        # single-quoted expression string to assert_true for later eval,
-        # so the variables below expand at eval-time, not here.
         # shellcheck disable=SC2016
         assert_true '[[ "${output}" == \{*\} ]]' "report starts/ends with braces"
         # shellcheck disable=SC2016
-        assert_true 'printf "%s" "${output}" | grep -q "\"status\":\"CGNAT\""' "status field present"
+        assert_true 'printf "%s" "${output}" | grep -q "\"status\":\"POSSIBLE_CGNAT\""' "status field present"
+        # shellcheck disable=SC2016
+        assert_true 'printf "%s" "${output}" | grep -q "\"router_wan\":null"' "router_wan is null when unknown (no jq)"
     fi
 }
 
-test_json_build_report_null_fields() {
+test_json_build_report_with_traceroute() {
+    local hops
+    hops=$(printf '1 192.168.1.1\n2 8.8.8.8\n')
     local output
-    output=$(json_build_report "PUBLIC" 0 "" "" "" "" "" "false" "false" "false" "false" "")
+    output=$(json_build_report "PUBLIC" 0 "192.168.1.15" "192.168.1.1" \
+        "8.8.8.8" "8.8.8.8" "" "" "Public IPv4 confirmed." "" "${hops}")
 
     if has_cmd jq; then
-        assert_true "printf '%s' '${output}' | jq -e . >/dev/null 2>&1" "report with empty fields is still valid JSON"
-        local ipv6
-        ipv6=$(printf '%s' "${output}" | jq -r '.ipv6')
-        assert_equals "null" "${ipv6}" "empty ipv6 becomes JSON null"
+        assert_true "printf '%s' '${output}' | jq -e . >/dev/null 2>&1" "report with traceroute is valid JSON"
+        local trace_count
+        trace_count=$(printf '%s' "${output}" | jq '.traceroute | length')
+        assert_equals "2" "${trace_count}" "traceroute field has the expected hop count when provided"
     else
         # shellcheck disable=SC2016
-        assert_true 'printf "%s" "${output}" | grep -q "\"ipv6\":null"' "empty ipv6 becomes JSON null (no jq)"
+        assert_true 'printf "%s" "${output}" | grep -q "\"traceroute\":\["' "traceroute field present when hops are provided (no jq)"
+    fi
+}
+
+test_json_build_report_omits_traceroute_when_absent() {
+    local output
+    output=$(json_build_report "INCONCLUSIVE" 20 "" "" "" "" "" "" "Not enough evidence." "" "")
+
+    if has_cmd jq; then
+        local has_field
+        has_field=$(printf '%s' "${output}" | jq 'has("traceroute")')
+        assert_equals "false" "${has_field}" "traceroute field is entirely absent when no hops were provided"
+    else
+        # shellcheck disable=SC2016
+        assert_false 'printf "%s" "${output}" | grep -q "\"traceroute\""' "no traceroute field present (no jq)"
     fi
 }
 
@@ -97,5 +145,8 @@ run_test_suite "JSON Encoding Tests" \
     test_json_string_or_null \
     test_json_bool \
     test_json_array_of_strings \
+    test_json_array_of_hops \
+    test_json_array_of_evidence \
     test_json_build_report_is_valid \
-    test_json_build_report_null_fields
+    test_json_build_report_with_traceroute \
+    test_json_build_report_omits_traceroute_when_absent
